@@ -20,6 +20,14 @@ if %errorlevel% neq 0 (
 )
 
 echo.
+echo Checking EasyOCR models...
+%PYTHON% code/download_ocr_models.py
+if %errorlevel% neq 0 (
+    echo [WARN] OCR models not fully downloaded. Auto-annotation may not work.
+    echo        You can re-run: %PYTHON% code/download_ocr_models.py
+)
+
+echo.
 echo Starting UI - open http://127.0.0.1:7860 in your browser
 %PYTHON% ui/app.py
 pause

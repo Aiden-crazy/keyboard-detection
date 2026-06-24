@@ -2,15 +2,54 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
+import signal
 import sys
 
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+# ── Suppress Intel MKL / OpenBLAS thread pools & console hooks ──────────
+for _k, _v in [
+    ("KMP_DUPLICATE_LIB_OK", "TRUE"),
+    ("OMP_NUM_THREADS", "1"),
+    ("MKL_NUM_THREADS", "1"),
+    ("OPENBLAS_NUM_THREADS", "1"),
+    ("OMP_WAIT_POLICY", "passive"),
+    ("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1"),
+]:
+    os.environ.setdefault(_k, _v)
+
+
+# ── Windows console close → immediate exit (bypasses MKL cleanup hang) ──
+if sys.platform == "win32":
+    _CTRL_CLOSE_EVENT = 2
+    _CTRL_LOGOFF_EVENT = 5
+    _CTRL_SHUTDOWN_EVENT = 6
+
+    @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)  # type: ignore[misc]
+    def _win_console_handler(event_type: int) -> int:
+        if event_type in (_CTRL_CLOSE_EVENT, _CTRL_LOGOFF_EVENT, _CTRL_SHUTDOWN_EVENT):
+            os._exit(0)
+        return 0  # pass other events to next handler
+
+    try:
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_win_console_handler, True)  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
+def _signal_handler(sig: int, frame: object) -> None:
+    print("\nShutting down...")
+    os._exit(0)
+
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 import argparse
 import base64
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import uuid
@@ -60,18 +99,37 @@ _CANVAS_JS = """<script>
     var CLASSES = classes;
     var boxes = [];
     var selectedIndex = -1;
+    var hoveredIndex = -1;
     var drawing = false, hasMoved = false;
     var startX = 0, startY = 0, currentX = 0, currentY = 0;
     var ctx = canvas.getContext('2d');
 
+    // Load image, then init everything after it's ready
     var img = imgCache[imgInfo.b64] || new Image();
     imgCache[imgInfo.b64] = img;
-    if (!img.complete || !img.naturalWidth) {
-      img.onload = function() { ctx.drawImage(img, 0, 0); };
-    } else {
-      ctx.drawImage(img, 0, 0);
-    }
     img.src = img.src || 'data:image/png;base64,' + imgInfo.b64;
+
+    function afterImageReady() {
+      redraw();
+      // Load pre-filled boxes (OCR/model auto-annotations)
+      var preFilledEl = document.getElementById('anno-pre-filled');
+      if (preFilledEl && preFilledEl.value) {
+        try {
+          var preBoxes = JSON.parse(preFilledEl.value);
+          for (var pb = 0; pb < preBoxes.length; pb++) {
+            boxes.push(preBoxes[pb]);
+          }
+          redraw();
+          updateTable();
+        } catch(e) {}
+      }
+    }
+
+    if (img.complete && img.naturalWidth) {
+      afterImageReady();
+    } else {
+      img.onload = afterImageReady;
+    }
 
     function getCoords(e) {
       var rect = canvas.getBoundingClientRect();
@@ -81,14 +139,29 @@ _CANVAS_JS = """<script>
       };
     }
 
+    function hitTest(x, y, tolerance) {
+      tolerance = tolerance || 0;
+      for (var i = boxes.length - 1; i >= 0; i--) {
+        if (x >= boxes[i].x1 - tolerance && x <= boxes[i].x2 + tolerance &&
+            y >= boxes[i].y1 - tolerance && y <= boxes[i].y2 + tolerance) {
+          return i;
+        }
+      }
+      return -1;
+    }
+
     function redraw() {
       ctx.clearRect(0, 0, IMG_W, IMG_H);
       ctx.drawImage(img, 0, 0);
       for (var i = 0; i < boxes.length; i++) {
-        var b = boxes[i], isSel = i === selectedIndex;
+        var b = boxes[i], isSel = i === selectedIndex, isHov = i === hoveredIndex;
         ctx.strokeStyle = isSel ? '#FFD700' : '#00FF00';
         ctx.lineWidth = isSel ? 3 : 2;
         ctx.strokeRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+        if (isHov && !isSel) {
+          ctx.fillStyle = 'rgba(0,255,0,0.15)';
+          ctx.fillRect(b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1);
+        }
         var found = CLASSES.find(function(c) { return c.id === b.class_id; });
         var text = found ? found.str : '?';
         ctx.font = '16px sans-serif';
@@ -123,9 +196,16 @@ _CANVAS_JS = """<script>
       tbody.innerHTML = rows;
       var countEl = document.getElementById('box-count');
       if (countEl) countEl.textContent = boxes.length;
+      // Scroll to selected row
+      if (selectedIndex >= 0) {
+        setTimeout(function() {
+          var selRow = tbody.querySelector('tr.selected');
+          if (selRow) selRow.scrollIntoView({ block: 'nearest' });
+        }, 50);
+      }
     }
 
-    // Exposed global functions for inline onclick
+    // Exposed global functions
     window.__selectBox = function(i) {
       if (i >= 0 && i < boxes.length) {
         selectedIndex = i;
@@ -137,9 +217,18 @@ _CANVAS_JS = """<script>
 
     window.__deleteBox = function(i) {
       boxes.splice(i, 1);
-      if (selectedIndex >= boxes.length) selectedIndex = boxes.length - 1;
+      selectedIndex = -1;
       redraw();
       updateTable();
+    };
+
+    window.__deleteSelected = function() {
+      if (selectedIndex >= 0) {
+        boxes.splice(selectedIndex, 1);
+        selectedIndex = -1;
+        redraw();
+        updateTable();
+      }
     };
 
     window.__getAnnotations = function() {
@@ -154,7 +243,7 @@ _CANVAS_JS = """<script>
       }));
     };
 
-    // Canvas event handlers (inline on canvas)
+    // Canvas event handlers
     canvas.onmousedown = function(e) {
       var coords = getCoords(e);
       startX = coords.x; startY = coords.y;
@@ -162,6 +251,7 @@ _CANVAS_JS = """<script>
       drawing = true; hasMoved = false;
       e.preventDefault();
     };
+
     canvas.onmousemove = function(e) {
       var coords = getCoords(e);
       var ci = document.getElementById('coord-info');
@@ -170,20 +260,26 @@ _CANVAS_JS = """<script>
         currentX = coords.x; currentY = coords.y;
         if (Math.abs(currentX - startX) > 2 || Math.abs(currentY - startY) > 2) hasMoved = true;
         redraw();
+      } else {
+        // Hover detection
+        var prevHover = hoveredIndex;
+        hoveredIndex = hitTest(coords.x, coords.y, 2);
+        canvas.style.cursor = hoveredIndex >= 0 ? 'pointer' : 'crosshair';
+        if (prevHover !== hoveredIndex) redraw();
       }
     };
+
     canvas.onmouseup = function(e) {
       if (!drawing) return;
       drawing = false;
       if (!hasMoved) {
-        var found = -1;
-        for (var i = boxes.length - 1; i >= 0; i--) {
-          if (currentX >= boxes[i].x1 && currentX <= boxes[i].x2 &&
-              currentY >= boxes[i].y1 && currentY <= boxes[i].y2) { found = i; break; }
-        }
-        selectedIndex = found;
+        // Click (not drag) — try to select a box
+        var found = hitTest(currentX, currentY, 3);
         if (found >= 0) {
+          selectedIndex = found;
           window.__setClass(boxes[found].class_id, document.querySelector('#anno-keyboard .kb-key[data-cls="' + boxes[found].class_id + '"]'));
+        } else {
+          selectedIndex = -1;
         }
         redraw(); updateTable();
       } else {
@@ -195,8 +291,10 @@ _CANVAS_JS = """<script>
         }
       }
     };
+
     canvas.onmouseleave = function() {
       if (drawing) { drawing = false; redraw(); }
+      if (hoveredIndex >= 0) { hoveredIndex = -1; redraw(); }
     };
 
     // Clear button
@@ -205,6 +303,19 @@ _CANVAS_JS = """<script>
       clearBtn.__bound = true;
       clearBtn.onclick = function() {
         boxes = []; selectedIndex = -1; redraw(); updateTable();
+      };
+    }
+
+    // Delete-selected button
+    var delSelBtn = document.getElementById('btn-del-selected');
+    if (delSelBtn && !delSelBtn.__bound) {
+      delSelBtn.__bound = true;
+      delSelBtn.onclick = function() {
+        if (selectedIndex >= 0) {
+          boxes.splice(selectedIndex, 1);
+          selectedIndex = -1;
+          redraw(); updateTable();
+        }
       };
     }
 
@@ -225,17 +336,15 @@ _CANVAS_JS = """<script>
     var firstKey = document.querySelector('#anno-keyboard .kb-key');
     if (firstKey) currentClassId = parseInt(firstKey.getAttribute('data-cls'));
 
-    // Keyboard delete
+    // Keyboard shortcuts
     document.addEventListener('keydown', function(e) {
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIndex >= 0) {
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
         boxes.splice(selectedIndex, 1);
-        if (selectedIndex >= boxes.length) selectedIndex = boxes.length - 1;
+        selectedIndex = -1;
         redraw(); updateTable();
       }
     });
-
-    redraw();
   }
 
   function tryInit() {
@@ -523,10 +632,11 @@ def numpy_to_base64(image: np.ndarray) -> tuple[str, int, int]:
     return base64.b64encode(buf.getvalue()).decode("utf-8"), disp_w, disp_h
 
 
-def build_annotation_html(b64: str, img_w: int, img_h: int, classes: list[dict[str, object]]) -> str:
+def build_annotation_html(b64: str, img_w: int, img_h: int, classes: list[dict[str, object]], auto_annotations: list[dict[str, object]] | None = None) -> str:
     """Return self-contained HTML for the annotation canvas (no <script>, options pre-built)."""
     classes_json = json.dumps(classes, ensure_ascii=False)
     img_info_json = json.dumps({"w": img_w, "h": img_h, "b64": b64}, ensure_ascii=False)
+    auto_json = json.dumps(auto_annotations or [], ensure_ascii=False)
 
     # 68-key visual keyboard layout: (class_id, label, width_units)
     keyboard_rows = [
@@ -577,7 +687,8 @@ def build_annotation_html(b64: str, img_w: int, img_h: int, classes: list[dict[s
     {keys_html}
   </div>
   <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end;">
-    <span class="hint">点击键盘按键选择类别<br>然后在图片上拖拽绘制标注框</span>
+    <span class="hint">点击键盘按键选择类别<br>在图片上拖拽绘制标注框<br>点击已有框 → Delete 键删除</span>
+    <button id="btn-del-selected" style="padding:8px 16px;background:#fff3cd;border:1px solid #ffc107;color:#856404;font-weight:600;font-size:15px;border-radius:5px;cursor:pointer;">删除选中框</button>
     <button id="btn-clear" class="danger">清除全部</button>
   </div>
 </div>
@@ -594,10 +705,34 @@ def build_annotation_html(b64: str, img_w: int, img_h: int, classes: list[dict[s
 </div>
 <textarea id="anno-img-data" style="display:none;">{img_info_json}</textarea>
 <textarea id="anno-classes" style="display:none;">{classes_json}</textarea>
+<textarea id="anno-pre-filled" style="display:none;">{auto_json}</textarea>
 </div>"""
 
+def _build_annotation_result(image: np.ndarray, auto_annotations: list[dict[str, object]] | None = None) -> tuple[str, str, str]:
+    """Normalize image, save temp, encode base64, build annotation HTML. Returns (html, temp_path, b64)."""
+    image = normalize_image(image)
+    ensure_dir(TEMP_DIR)
+    temp_path = TEMP_DIR / f"annotation_{uuid.uuid4().hex[:8]}.jpg"
+    Image.fromarray(image).save(str(temp_path), "JPEG", quality=95)
+    b64, disp_w, disp_h = numpy_to_base64(image)
+    classes = load_class_list()
+    html = build_annotation_html(b64, disp_w, disp_h, classes, auto_annotations)
+    return html, str(temp_path), b64
+
+
 def on_image_upload(image: np.ndarray | None) -> tuple[str, str, str]:
-    """Handle image upload in the annotation tab. Returns (html, temp_path, b64)."""
+    """Handle image upload — just display the canvas, no auto-annotation."""
+    if image is None:
+        return (
+            "<div style='padding:40px;text-align:center;color:#888;'><h3>请先上传一张键盘图片</h3></div>",
+            "",
+            "",
+        )
+    return _build_annotation_result(image)
+
+
+def trigger_ocr(image: np.ndarray | None, conf: float = 0.10) -> tuple[str, str, str]:
+    """Run EasyOCR on the uploaded image and pre-fill annotation boxes."""
     if image is None:
         return (
             "<div style='padding:40px;text-align:center;color:#888;'><h3>请先上传一张键盘图片</h3></div>",
@@ -605,15 +740,152 @@ def on_image_upload(image: np.ndarray | None) -> tuple[str, str, str]:
             "",
         )
     image = normalize_image(image)
+    _, disp_w, disp_h = numpy_to_base64(image)
+    try:
+        auto_annotations = ocr_auto_annotate(image, disp_w, disp_h, conf_threshold=float(conf))
+    except Exception:
+        auto_annotations = None
+    return _build_annotation_result(image, auto_annotations)
 
-    ensure_dir(TEMP_DIR)
-    temp_path = TEMP_DIR / f"annotation_{uuid.uuid4().hex[:8]}.jpg"
-    Image.fromarray(image).save(str(temp_path), "JPEG", quality=95)
 
-    b64, disp_w, disp_h = numpy_to_base64(image)
-    classes = load_class_list()
-    html = build_annotation_html(b64, disp_w, disp_h, classes)
-    return html, str(temp_path), b64
+def trigger_model(image: np.ndarray | None, model_path: str = "", conf: float = 0.10) -> tuple[str, str, str]:
+    """Run YOLO model on the uploaded image and pre-fill annotation boxes."""
+    if image is None:
+        return (
+            "<div style='padding:40px;text-align:center;color:#888;'><h3>请先上传一张键盘图片</h3></div>",
+            "",
+            "",
+        )
+    image = normalize_image(image)
+    original_h, original_w = image.shape[:2]
+    _, disp_w, disp_h = numpy_to_base64(image)
+    auto_annotations = None
+    if model_path and Path(model_path).exists():
+        try:
+            model = load_model(model_path)
+            result = model.predict(source=image, conf=float(conf), imgsz=640, verbose=False)[0]
+            if result.boxes is not None and len(result.boxes) > 0:
+                scale_x = disp_w / original_w
+                scale_y = disp_h / original_h
+                auto_annotations = []
+                for box, cls_id in zip(result.boxes.xyxy.cpu().numpy(), result.boxes.cls.cpu().numpy().astype(int)):
+                    x1, y1, x2, y2 = box.tolist()
+                    auto_annotations.append({
+                        "class_id": int(cls_id),
+                        "x1": round(x1 * scale_x),
+                        "y1": round(y1 * scale_y),
+                        "x2": round(x2 * scale_x),
+                        "y2": round(y2 * scale_y),
+                    })
+        except Exception:
+            pass
+    return _build_annotation_result(image, auto_annotations)
+
+
+OCR_TEXT_TO_CLASS: dict[str, int] = {
+    **{str(d): d for d in range(10)},
+    **{chr(ord("a") + i): 10 + i for i in range(26)},
+    **{chr(ord("A") + i): 10 + i for i in range(26)},
+    # Punctuation on number keys (OCR may read the symbol instead of the digit)
+    "!": 1, "@": 2, "#": 3, "$": 4, "%": 5, "^": 6, "&": 7, "*": 8, "(": 9, ")": 0,
+    # Special keys
+    "esc": 36, "escape": 36,
+    "tab": 37, "tah": 37,
+    "caps": 38, "capslock": 38, "caps lock": 38, "caplock": 38,
+    "shift": 39, "shft": 39, "shif": 39, "shlft": 39,
+    "ctrl": 40, "control": 40, "ctr": 40, "ctl": 40, "ctri": 40,
+    "alt": 41, "ait": 41,
+    "enter": 42, "return": 42, "ent": 42, "enterkey": 42,
+    "backspace": 43, "back": 43, "bksp": 43, "bkspace": 43, "backspc": 43, "bk Space": 43,
+    "space": 44, "spc": 44, "spacebar": 44, "space bar": 44,
+}
+_OCR_READER: object = None
+
+
+def _get_ocr_reader() -> object:
+    global _OCR_READER
+    if _OCR_READER is None:
+        import easyocr  # type: ignore[reportMissingImports]
+        model_dir = MODELS_DIR / "easyocr"
+        ensure_dir(model_dir)
+        _OCR_READER = easyocr.Reader(["en"], gpu=False, model_storage_directory=str(model_dir), verbose=False)
+    return _OCR_READER
+
+
+def ocr_auto_annotate(image: np.ndarray, disp_w: int, disp_h: int, conf_threshold: float = 0.10) -> list[dict[str, object]]:
+    """Use EasyOCR to detect text regions on keyboard and map to class IDs."""
+    reader = _get_ocr_reader()
+    original_h, original_w = image.shape[:2]
+    scale_x = disp_w / original_w
+    scale_y = disp_h / original_h
+
+    results = reader.readtext(
+        image,
+        detail=1,
+        text_threshold=0.35,   # lower = more text detected (default 0.7)
+        low_text=0.15,         # lower bound for low-confidence text (default 0.4)
+        mag_ratio=2.0,         # 2.0: ~36% faster than 2.5, still catches small keys
+    )
+    annotations: list[dict[str, object]] = []
+    for bbox, text, conf in results:
+        if conf < conf_threshold:
+            continue
+        cleaned = re.sub(r"\s+", " ", text).strip().lower()
+
+        # Skip known non-class keys
+        if cleaned in {"win", "windows", "fn", "prtsc", "prtscreen", "print", "scroll",
+                       "pause", "insert", "ins", "home", "end", "pgup", "pgdn",
+                       "num", "numlk", "numlock", "delete", "del",
+                       "up", "down", "left", "right"}:
+            continue
+        # Skip function keys F1-F24
+        if re.match(r"^f\d{1,2}$", cleaned):
+            continue
+
+        cls_id = OCR_TEXT_TO_CLASS.get(cleaned)
+        if cls_id is None:
+            stripped = re.sub(r"[^a-z0-9]", "", cleaned)
+            cls_id = OCR_TEXT_TO_CLASS.get(stripped)
+        if cls_id is None and len(cleaned) == 1:
+            cls_id = OCR_TEXT_TO_CLASS.get(cleaned)
+        if cls_id is None:
+            continue
+        x1 = min(p[0] for p in bbox)
+        y1 = min(p[1] for p in bbox)
+        x2 = max(p[0] for p in bbox)
+        y2 = max(p[1] for p in bbox)
+        annotations.append({
+            "class_id": cls_id,
+            "x1": round(x1 * scale_x),
+            "y1": round(y1 * scale_y),
+            "x2": round(x2 * scale_x),
+            "y2": round(y2 * scale_y),
+            "_rel_y": (y1 + y2) / 2 / original_h,  # relative Y for position heuristic
+        })
+
+    # Post-processing: fix common OCR confusions
+    for ann in annotations:
+        if ann["class_id"] == 2:  # OCR read "2" — might be Z
+            if ann["_rel_y"] > 0.55:  # in bottom 45% = letter zone
+                has_number_row_2 = any(
+                    a["class_id"] == 2 and a.get("_rel_y", 0.5) < 0.35
+                    for a in annotations
+                )
+                if not has_number_row_2:
+                    ann["class_id"] = 35  # remap to Z
+        elif ann["class_id"] == 0:  # OCR read "0" — might be O
+            if ann["_rel_y"] > 0.55:
+                has_number_row_0 = any(
+                    a["class_id"] == 0 and a.get("_rel_y", 0.5) < 0.35
+                    for a in annotations
+                )
+                if not has_number_row_0:
+                    ann["class_id"] = 24  # remap to O
+
+    # Strip internal keys before returning
+    for ann in annotations:
+        ann.pop("_rel_y", None)
+    return annotations
 
 
 def dhash(path: Path, hash_size: int = 16) -> str:
@@ -782,11 +1054,17 @@ def create_demo(default_model: Path) -> gr.Blocks:
                 with gr.Row():
                     with gr.Column(scale=1, min_width=200):
                         annotation_image = gr.Image(label="1. 上传图片", type="numpy", height=320)
+                        auto_conf = gr.Slider(label="OCR 置信度阈值（越低框越多、误标也越多）", minimum=0.05, maximum=0.5, value=0.20, step=0.05)
+                        ocr_button = gr.Button("OCR 自动标注（推荐）", variant="primary")
+                        gr.Markdown("<span style='font-size:12px;color:#888;'>使用 EasyOCR 识别按键文字，<br>字母数字都能检测，与训练无关。</span>")
+                        gr.Markdown("---")
+                        auto_model = gr.Textbox(label="YOLO 模型路径（需训练 100+ 张图才好用）", value=str(DEFAULT_MODEL) if DEFAULT_MODEL.exists() else "models/yolo11n.pt")
+                        model_button = gr.Button("模型自动标注（数据少时效果差）", variant="secondary", size="sm")
                     with gr.Column(scale=1, min_width=180):
                         save_button = gr.Button("3. 保存标注到数据集", variant="primary")
                         save_status = gr.Textbox(label="保存状态", lines=2, interactive=False)
                     with gr.Column(scale=6):
-                        gr.Markdown("**2. 先在左侧列表中点击选择类别，再在图片上按住鼠标拖拽绘制标注框**")
+                        gr.Markdown("**2. 推荐先用 OCR 自动标注 → 手动修正 → 攒够 100+ 张图再训练模型**")
                 annotation_html = gr.HTML(label="标注画布")
                 temp_image_path = gr.State("")
                 image_b64_state = gr.State("")
@@ -795,6 +1073,16 @@ def create_demo(default_model: Path) -> gr.Blocks:
                 annotation_image.change(
                     fn=on_image_upload,
                     inputs=[annotation_image],
+                    outputs=[annotation_html, temp_image_path, image_b64_state],
+                )
+                ocr_button.click(
+                    fn=trigger_ocr,
+                    inputs=[annotation_image, auto_conf],
+                    outputs=[annotation_html, temp_image_path, image_b64_state],
+                )
+                model_button.click(
+                    fn=trigger_model,
+                    inputs=[annotation_image, auto_model, auto_conf],
                     outputs=[annotation_html, temp_image_path, image_b64_state],
                 )
                 save_button.click(
@@ -813,11 +1101,12 @@ def create_demo(default_model: Path) -> gr.Blocks:
 
 def main() -> None:
     args = parse_args()
+    os.environ.setdefault("GRADIO_TEMP_DIR", str(TEMP_DIR))
     # Auto-create essential directories
     for d in [DATA_DIR, RAW_DIR, SELECTED_DIR, LABELS_DIR, TEMP_DIR, MODELS_DIR, OUTPUTS_DIR, DEFAULT_OUTPUT_DIR]:
         ensure_dir(d)
     demo = create_demo(args.model)
-    demo.queue().launch(
+    demo.queue(default_concurrency_limit=2).launch(
         server_name=args.host,
         server_port=args.port,
         share=args.share,
