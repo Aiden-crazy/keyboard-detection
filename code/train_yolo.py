@@ -1,4 +1,4 @@
-﻿"""Train a YOLO model for keyboard key/character detection."""
+"""Train a YOLO model for keyboard key/character detection."""
 
 from __future__ import annotations
 
@@ -44,15 +44,14 @@ def restore_yaml_path(yaml_path: Path, original: str) -> None:
 
 
 def resolve_model(name: str) -> Path:
-    """Resolve a model name/path, try local first then let Ultralytics download."""
+    """Resolve a model name/path, checking local models/ directory first."""
     path = Path(name)
     if path.exists():
         return path.resolve()
     local = MODELS_DIR / path.name
     if local.exists():
         return local
-    # None of these worked, return the bare name so Ultralytics auto-downloads
-    return Path(path.name)
+    raise FileNotFoundError(f"Model not found: {name} (checked {local} as well)")
 
 
 def main() -> None:

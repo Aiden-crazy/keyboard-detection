@@ -1,4 +1,4 @@
-﻿"""Gradio UI for keyboard YOLO training and detection."""
+"""Gradio UI for keyboard YOLO training and detection."""
 
 from __future__ import annotations
 
@@ -658,10 +658,20 @@ def save_annotations(temp_path_str: str, json_data: str, b64_fallback: str) -> t
     except json.JSONDecodeError:
         return "标注数据解析失败，请重试。", dataset_status()
 
-    # Always save with a new unique sequential filename
-    existing = count_files(SELECTED_DIR, IMAGE_EXTS)
-    stem = f"keyboard_{existing + 1:04d}"
-    image_target = next_available_path(SELECTED_DIR, stem, temp_path.suffix.lower())
+    # Check if this image matches an existing selected image by perceptual hash
+    matched_stem = None
+    for p in sorted(SELECTED_DIR.iterdir(), key=lambda x: x.name):
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
+            if have_same_image(temp_path, p):
+                matched_stem = p.stem
+                break
+
+    if matched_stem:
+        image_target = SELECTED_DIR / f"{matched_stem}{temp_path.suffix.lower()}"
+    else:
+        existing = count_files(SELECTED_DIR, IMAGE_EXTS)
+        stem = f"keyboard_{existing + 1:04d}"
+        image_target = next_available_path(SELECTED_DIR, stem, temp_path.suffix.lower())
 
     shutil.copy2(str(temp_path), str(image_target))
 
@@ -732,7 +742,7 @@ def create_demo(default_model: Path) -> gr.Blocks:
                         status = gr.Textbox(label="数据状态", value=dataset_status(), lines=8)
                         refresh = gr.Button("刷新状态")
                 with gr.Row():
-                    base = gr.Textbox(label="基础模型", value="yolo11n.pt")
+                    base = gr.Textbox(label="基础模型", value="models/yolo11n.pt")
                     exp_name = gr.Textbox(label="实验名称", value="keyboard_yolo")
                     device = gr.Textbox(label="设备：留空自动，CPU 填 cpu，显卡填 0", value="")
                 with gr.Row():
@@ -808,7 +818,6 @@ def main() -> None:
         ensure_dir(d)
     demo = create_demo(args.model)
     demo.queue().launch(
-        allowed_paths=[str(TRAIN_DIR), str(DEFAULT_OUTPUT_DIR), str(MODELS_DIR), str(SELECTED_DIR)],
         server_name=args.host,
         server_port=args.port,
         share=args.share,
